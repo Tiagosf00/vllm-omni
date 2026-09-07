@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -48,6 +49,37 @@ from vllm_omni.entrypoints.duplex.websocket import (
 logger = init_logger(__name__)
 
 _MAX_EVENT_BYTES = 15 * 1024 * 1024
+
+
+def compute_silence_continuation_deadline(
+    *,
+    chunk_period_s: float,
+    now: float,
+    last_submit: float | None,
+    prior_deadline: float | None,
+) -> tuple[float, float]:
+    """Return the deadline-aligned silence continuation ``(delay_s, next_deadline)``.
+
+    Unit N+1 is due at ``submission_time_N + chunk_period_s``; ``delay_s`` is
+    the remaining budget (``max(0, deadline - now)``) and ``next_deadline``
+    advances from the prior deadline, never from ``now``, so pipeline
+    processing time does not accumulate as timer drift.
+
+    After a stall longer than one chunk period the chain is stale: the next
+    unit re-anchors to ``now + chunk_period_s`` so a burst of catch-up
+    continuations does not fire. ``last_submit is None`` (no unit submitted
+    yet) and ``prior_deadline is None`` (first continuation) both anchor to
+    ``now``.
+    """
+    if prior_deadline is None:
+        base = last_submit if last_submit is not None else now
+        deadline = base + chunk_period_s
+    elif now - prior_deadline > chunk_period_s:
+        deadline = now + chunk_period_s
+    else:
+        deadline = prior_deadline
+    delay_s = max(0.0, deadline - now)
+    return delay_s, deadline + chunk_period_s
 
 
 class DuplexSessionRunnerMixin:
@@ -326,6 +358,7 @@ class DuplexSessionRunnerMixin:
             operation_id: str | None = None,
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
+            silence_deadline: float | None = None,
             before_append=None,
         ) -> asyncio.Task[bool] | None:
             if session is None:
@@ -362,6 +395,16 @@ class DuplexSessionRunnerMixin:
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
+                    # Record the submission time of this native unit so silence
+                    # continuations align to the chunk-period cadence. The
+                    # deadline only advances once the append actually submits;
+                    # a real (non-silence) input re-anchors the chain.
+                    native.last_native_submit_monotonic = time.monotonic()
+                    if silence_continuation:
+                        if silence_deadline is not None:
+                            native.silence_deadline_monotonic = silence_deadline
+                    else:
+                        native.silence_deadline_monotonic = None
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
@@ -564,7 +607,18 @@ class DuplexSessionRunnerMixin:
                 float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
             )
             if continuation_delay_s > 0:
-                await asyncio.sleep(continuation_delay_s)
+                # Align the next silence unit to submission_time_N + chunk_period
+                # and sleep only the remaining budget. The deadline is stored by
+                # _run() when the append actually submits, so skipped or stale
+                # continuations never advance the clock.
+                delay_s, next_deadline = compute_silence_continuation_deadline(
+                    chunk_period_s=continuation_delay_s,
+                    now=time.monotonic(),
+                    last_submit=native.last_native_submit_monotonic,
+                    prior_deadline=native.silence_deadline_monotonic,
+                )
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
                 if (
                     actor.native_append_tail is not append_tail
                     or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
@@ -596,6 +650,7 @@ class DuplexSessionRunnerMixin:
                 payload,
                 final=False,
                 silence_continuation=True,
+                silence_deadline=next_deadline,
                 before_append=_still_valid,
             )
             if task is None:
