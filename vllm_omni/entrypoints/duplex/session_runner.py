@@ -396,12 +396,17 @@ class DuplexSessionRunnerMixin:
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
-                    # Anchor the submission time before the RPC. The timing
-                    # state is only committed below if the append actually
-                    # submitted in the captured epoch, so a failed or stale
-                    # append cannot advance the deadline, and an old operation
-                    # that races a newer turn never overwrites its clock.
-                    submit_time = time.monotonic()
+
+                    def _on_append_accepted(submit_time: float) -> None:
+                        # Commit timing state once the runtime accepts the
+                        # append; a real (non-silence) input re-anchors it.
+                        native.last_native_submit_monotonic = submit_time
+                        if silence_continuation:
+                            if silence_deadline is not None:
+                                native.silence_deadline_monotonic = silence_deadline
+                        else:
+                            native.silence_deadline_monotonic = None
+
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
@@ -410,17 +415,8 @@ class DuplexSessionRunnerMixin:
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
+                        on_append_accepted=_on_append_accepted,
                     )
-                    if append_ok and session.epoch == append_epoch:
-                        # The append was accepted in the captured epoch. Record
-                        # the submission time and the continuation deadline; a
-                        # real (non-silence) input re-anchors the chain.
-                        native.last_native_submit_monotonic = submit_time
-                        if silence_continuation:
-                            if silence_deadline is not None:
-                                native.silence_deadline_monotonic = silence_deadline
-                        else:
-                            native.silence_deadline_monotonic = None
                     if append_ok:
                         native.native_context_locked = True
                         if pcm_reservation is not None:
