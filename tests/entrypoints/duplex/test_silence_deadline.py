@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Deterministic unit tests for deadline-aligned silence continuation.
 
@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("chunk_period_s", "now", "last_submit", "prior_deadline", "delay_s", "next_deadline"),
+    ("chunk_period_s", "now", "last_submit", "current_deadline", "delay_s", "next_silence_deadline"),
     [
         # First continuation anchors to the last real submission: unit N was
         # submitted at t=1.0, audio N produced at 1.4 -> 0.6 s of sleep left.
@@ -39,17 +39,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         (1.0, 2.5, 1.0, None, 0.0, 3.0),
         # No submission yet (None): the first continuation anchors to now.
         (1.0, 0.4, None, None, 1.0, 2.4),
-        # Deadlines advance from the prior deadline, not from now, so pipeline
+        # Deadlines advance from the current deadline, not from now, so pipeline
         # processing time does not accumulate as timer drift.
         (1.0, 4.2, 3.0, 5.0, 0.8, 6.0),
         # Two consecutive units that overrun their deadline by 0.2 s keep the
         # 1 s cadence: no sleep, and the chain advances one period each.
         (1.0, 2.2, 1.0, None, 0.0, 3.0),
         (1.0, 3.2, 2.0, 3.0, 0.0, 4.0),
-        # A short overshoot (within one period of the prior deadline) still
+        # A short overshoot (within one period of the current deadline) still
         # chases the stale deadline: immediate submit, chain advances.
         (1.0, 2.5, 1.0, 2.0, 0.0, 3.0),
-        # A long stall (more than one period past the prior deadline) submits
+        # A long stall (more than one period past the current deadline) submits
         # one continuation immediately and restarts from that submission.
         (1.0, 5.0, 1.0, 2.0, 0.0, 6.0),
         # The same recovery applies to the first continuation after a stall.
@@ -62,18 +62,18 @@ def test_compute_silence_continuation_deadline(
     chunk_period_s: float,
     now: float,
     last_submit: float | None,
-    prior_deadline: float | None,
+    current_deadline: float | None,
     delay_s: float,
-    next_deadline: float,
+    next_silence_deadline: float,
 ) -> None:
     delay, next_dl = compute_silence_continuation_deadline(
         chunk_period_s=chunk_period_s,
         now=now,
         last_submit=last_submit,
-        prior_deadline=prior_deadline,
+        current_deadline=current_deadline,
     )
     assert delay == pytest.approx(delay_s)
-    assert next_dl == pytest.approx(next_deadline)
+    assert next_dl == pytest.approx(next_silence_deadline)
 
 
 class TestSilenceDeadlineSessionState:
