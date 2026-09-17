@@ -7,7 +7,7 @@ These tests exercise the production ``_schedule_silence_continuation`` path
 (and the append acceptance callback it installs) rather than copying the
 scheduling arithmetic. The monotonic clock is a fake so the deadline math is
 deterministic, and ``asyncio.sleep`` is simulated by advancing that clock.
-A gated stage port lets a test control when an append actually completes.
+Append completion is controlled by gating the stage port's ``submit``.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from tests.engine.duplex.test_session_runner import (
     open_harness,
     tts_output,
 )
+from vllm_omni.engine.duplex.contracts import DuplexStageSubmission
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,26 +42,6 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.value
-
-
-class GatedPort:
-    """Wrap the recording stage port so a test controls when submits finish.
-
-    ``gate`` starts open; set it to ``asyncio.Event()`` (or clear it) to hold
-    appends in flight, then set it to release them.
-    """
-
-    def __init__(self, port: Any) -> None:
-        self._port = port
-        self.gate: asyncio.Event = asyncio.Event()
-        self.gate.set()
-
-    async def submit(self, submission: Any) -> Any:
-        await self.gate.wait()
-        return await self._port.submit(submission)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._port, name)
 
 
 async def _active_response_harness() -> Harness:
@@ -90,22 +71,25 @@ def _install_fake_clock(
     *,
     clock: FakeClock,
     real_sleep: Callable[..., Any],
-) -> None:
+) -> list[float]:
     """Point both modules at the fake clock and simulate ``asyncio.sleep``.
 
     ``real_sleep`` is the unpatched ``asyncio.sleep`` captured before patching;
     the simulated sleep advances the fake clock by the requested delay and then
-    yields control so the append task can run. ``stall`` (a one-element list)
-    is added once to the next sleep so a test can model a wake that happens
-    long after the planned deadline.
+    yields control so the append task can run. The returned ``stall`` list is
+    added once to the next *positive* sleep so a test can model a wake that
+    happens late (after the planned deadline); zero-duration scheduling yields
+    do not consume it.
     """
     monkeypatch.setattr(runner_module.time, "monotonic", clock)
     monkeypatch.setattr(model_channel_module.time, "monotonic", clock)
     stall: list[float] = [0.0]
 
     async def fake_sleep(delay: float) -> None:
-        clock.value += delay + stall[0]
-        stall[0] = 0.0
+        clock.value += delay
+        if delay > 0:
+            clock.value += stall[0]
+            stall[0] = 0.0
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
@@ -135,7 +119,9 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        await asyncio.sleep(0.05)
+        first_task = h.runner.tasks.append_tail
+        assert first_task is not None
+        assert await first_task
         # The accepted unit re-anchored the chain to its own submission time
         # (101.0) and stored the following deadline (102.0).
         assert h.runner.model_state.last_native_submit_monotonic == pytest.approx(101.0)
@@ -149,7 +135,9 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        await asyncio.sleep(0.05)
+        second_task = h.runner.tasks.append_tail
+        assert second_task is not None
+        assert await second_task
         assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(103.0)
     finally:
         await close_harness(h)
@@ -160,61 +148,83 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
     """A real append accepted after the silence was planned re-anchors the chain.
 
     The planned silence queues behind the real append; once the real append
-    completes and re-anchors, ``before_append`` detects the changed anchor and
-    the outdated silence is skipped (no submission, no callback overwrite).
+    completes and re-anchors, ``before_append`` detects the changed anchor
+    (numeric timestamp) and the outdated silence is skipped (no submission,
+    no callback overwrite).
     """
     clock = FakeClock(start=200.0)
     real_sleep = asyncio.sleep
     _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
     h = await _active_response_harness()
-    gated = GatedPort(h.port)
-    monkeypatch.setattr(h, "port", gated)
+    state = h.runner.model_state
+    submissions_before = len(h.port.submissions)
+
+    original_submit = h.port.submit
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_submit(submission: DuplexStageSubmission) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_submit(submission)
+
+    monkeypatch.setattr(h.port, "submit", gated_submit)
     try:
-        anchor_before = h.runner.model_state.last_native_submit_monotonic
-        # Hold the real append in flight; it will re-anchor on acceptance.
-        gated.gate = asyncio.Event()
-        real_task = asyncio.create_task(
-            h.runner._start_append(
-                h.runner.model.silence_unit_payload(),
-                final=False,
-                silence_continuation=False,
-            )
-        )
-        await asyncio.sleep(0.05)
-        assert not real_task.done()
+        # Existing anchor at t=200.0.
+        state.last_native_submit_monotonic = 200.0
+        state.silence_deadline_monotonic = None
 
-        # The silence is planned while the real append is queued ahead of it.
+        # The real append starts at t+0.8 and blocks inside the gate.
+        clock.value = 200.8
+        real_append_task = await h.runner._start_append(
+            h.runner.model.silence_unit_payload(),
+            final=False,
+            silence_continuation=False,
+        )
+        await entered.wait()
+        assert not real_append_task.done()
+
+        # At t+1.0 the silence is planned using the existing anchor; its append
+        # task waits behind the real append.
+        clock.value = 201.0
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
         assert scheduled is True
+        silence_task = h.runner.tasks.append_tail
+        assert silence_task is not None
+        assert not silence_task.done()
 
-        # Release the real append: it accepts and re-anchors the chain to its
-        # own submission time (a fresh object, distinct from the anchor the
-        # silence planned against).
-        gated.gate.set()
-        await real_task
-        await asyncio.sleep(0.05)
+        # At t+1.1 the real append is released; both appends finish.
+        clock.value = 201.1
+        release.set()
+        assert await real_append_task
+        assert await silence_task
 
-        # The outdated silence was skipped: its callback never overwrote the
-        # new anchor, and the deadline the real append cleared stays cleared.
-        assert h.runner.model_state.last_native_submit_monotonic is not anchor_before
-        assert h.runner.model_state.last_native_submit_monotonic is not None
-        assert h.runner.model_state.silence_deadline_monotonic is None
+        # Exactly one additional submission happened: the real append. The
+        # outdated silence was skipped, so its callback never overwrote the
+        # new anchor (the real append's submission time t+0.8), and the
+        # deadline the real append cleared stays cleared.
+        assert len(h.port.submissions) == submissions_before + 1
+        assert state.last_native_submit_monotonic == pytest.approx(200.8)
+        assert state.silence_deadline_monotonic is None
 
-        # A fresh continuation uses the new anchor.
+        # A fresh continuation uses the new anchor. The clock is left at t+1.1:
+        # the scheduler sleeps the remaining 0.7 s (deadline t+1.8), which
+        # verifies re-anchoring controls the wait. Following deadline t+2.8.
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        await asyncio.sleep(0.05)
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(
-            h.runner.model_state.last_native_submit_monotonic + CHUNK_PERIOD_S
-        )
+        fresh_task = h.runner.tasks.append_tail
+        assert fresh_task is not None
+        assert await fresh_task
+        assert state.last_native_submit_monotonic == pytest.approx(201.8)
+        assert state.silence_deadline_monotonic == pytest.approx(202.8)
     finally:
-        gated.gate.set()
+        release.set()
         await close_harness(h)
 
 
@@ -232,21 +242,27 @@ async def test_long_stall_saves_future_deadline_from_actual_submission(
     real_sleep = asyncio.sleep
     stall = _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
     h = await _active_response_harness()
+    state = h.runner.model_state
     try:
         # Plan a continuation whose deadline is 1.0 s in the future. The wake
-        # is delayed 2 s past the planned submission (clock 300 -> 303 during
-        # the scheduler's sleep), so the append accepts 2 s late.
-        h.runner.model_state.last_native_submit_monotonic = 300.0
-        h.runner.model_state.silence_deadline_monotonic = None
+        # is delayed 2 s past the planned submission (anchor + 3.0 during the
+        # scheduler's sleep), so the append accepts 2 s late.
+        anchor = clock.value
+        state.last_native_submit_monotonic = anchor
+        state.silence_deadline_monotonic = None
         stall[0] = 2.0
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        await asyncio.sleep(0.05)
-        # 303.0 > 302.0 (planned deadline + period) -> save 303.0 + 1.0.
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(304.0)
+        append_task = h.runner.tasks.append_tail
+        assert append_task is not None
+        assert await append_task
+        # anchor + 3.0 > anchor + 2.0 (planned deadline + period) -> save
+        # submit_time + period = anchor + 4.0.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 3.0)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 4.0)
     finally:
         await close_harness(h)
 
@@ -257,26 +273,33 @@ async def test_small_wakeup_delay_preserves_planned_deadline(
 ) -> None:
     """Ordinary wakeup jitter (within one period) keeps the planned cadence.
 
-    A submission slightly after the planned deadline must not reset the chain:
-    the stored deadline stays at ``planned + period`` so drift does not
-    accumulate.
+    A submission 0.2 s past the planned deadline must not reset the chain: the
+    stored deadline stays at ``planned + period`` so drift does not accumulate.
     """
     clock = FakeClock(start=400.0)
     real_sleep = asyncio.sleep
-    _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
+    stall = _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
     h = await _active_response_harness()
+    state = h.runner.model_state
     try:
-        h.runner.model_state.last_native_submit_monotonic = 400.0
-        h.runner.model_state.silence_deadline_monotonic = None
+        anchor = clock.value
+        state.last_native_submit_monotonic = anchor
+        state.silence_deadline_monotonic = None
+        stall[0] = 0.2
+
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        # Submitted 0.2 s late (within one period): keep the planned deadline.
-        clock.value = 401.2
-        await asyncio.sleep(0.05)
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(402.0)
+        append_task = h.runner.tasks.append_tail
+        assert append_task is not None
+        assert await append_task
+
+        # Submitted at anchor + period + 0.2 (within one period): the planned
+        # following deadline is kept.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + CHUNK_PERIOD_S + 0.2)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
     finally:
         await close_harness(h)
 
@@ -292,20 +315,27 @@ async def test_exact_one_period_late_preserves_planned_deadline(
     """
     clock = FakeClock(start=500.0)
     real_sleep = asyncio.sleep
-    _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
+    stall = _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
     h = await _active_response_harness()
+    state = h.runner.model_state
     try:
-        h.runner.model_state.last_native_submit_monotonic = 500.0
-        h.runner.model_state.silence_deadline_monotonic = None
+        anchor = clock.value
+        state.last_native_submit_monotonic = anchor
+        state.silence_deadline_monotonic = None
+        stall[0] = 1.0
+
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
         assert scheduled is True
-        # Submitted exactly at the planned following deadline (502.0).
-        clock.value = 502.0
-        await asyncio.sleep(0.05)
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(502.0)
+        append_task = h.runner.tasks.append_tail
+        assert append_task is not None
+        assert await append_task
+
+        # Submitted exactly at the planned following deadline: kept.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
     finally:
         await close_harness(h)
 
@@ -317,18 +347,24 @@ async def test_failed_append_leaves_timing_unchanged(monkeypatch: pytest.MonkeyP
     real_sleep = asyncio.sleep
     _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
     h = await _active_response_harness()
+    state = h.runner.model_state
     try:
+        state.last_native_submit_monotonic = 600.0
+        state.silence_deadline_monotonic = 601.0
+        before_anchor = state.last_native_submit_monotonic
+        before_deadline = state.silence_deadline_monotonic
         h.port.fail_submit = RuntimeError("boom")
-        before_anchor = h.runner.model_state.last_native_submit_monotonic
-        before_deadline = h.runner.model_state.silence_deadline_monotonic
+
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
         )
-        # The append fails; the scheduler reports the task, but timing is untouched.
         assert scheduled is True
-        await asyncio.sleep(0.05)
-        assert h.runner.model_state.last_native_submit_monotonic is before_anchor
-        assert h.runner.model_state.silence_deadline_monotonic is before_deadline
+        append_task = h.runner.tasks.append_tail
+        assert append_task is not None
+        # The append fails: its task reports failure, and timing is untouched.
+        assert await append_task is False
+        assert state.last_native_submit_monotonic == before_anchor
+        assert state.silence_deadline_monotonic == before_deadline
     finally:
         await close_harness(h)

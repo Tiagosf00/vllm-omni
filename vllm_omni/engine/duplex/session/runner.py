@@ -1110,7 +1110,7 @@ class DuplexSessionRunner:
             return (
                 # The anchor changed (a real append was accepted) after this
                 # continuation was planned; the unit is outdated.
-                model_state.last_native_submit_monotonic is anchor
+                model_state.last_native_submit_monotonic == anchor
                 and not self._real_input_waiting()
                 and not self.model.silence_continuation_is_stale(
                     request_id=request_id,
