@@ -120,6 +120,8 @@ class FakeModelSessionState(DuplexModelSessionState):
         self.continuation_units = 0
         self.pending_silence_task = None
         self.pending_silence_owner_id = None
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
 
     def retain_committed_audio(self, payload, *, operation_id, reserved_bytes=0) -> None:
         self.committed_audio_payload = payload
@@ -136,6 +138,8 @@ class FakeModelSessionState(DuplexModelSessionState):
     def clear_continuation(self) -> None:
         self.continuation_owner_id = None
         self.continuation_units = 0
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
 
 
 class FakeDataPlane(DuplexDataPlane):

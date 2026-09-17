@@ -123,6 +123,11 @@ class DuplexModelSessionState(ABC):
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
     pending_silence_owner_id: str | None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None
+    silence_deadline_monotonic: float | None
 
     @abstractmethod
     def retain_committed_audio(

@@ -21,6 +21,7 @@ orchestrator loop (the session is never touched from another thread):
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -124,6 +125,38 @@ class _Internal:
 
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
+
+
+def compute_silence_continuation_deadline(
+    *,
+    chunk_period_s: float,
+    now: float,
+    last_submit: float | None,
+    current_deadline: float | None,
+) -> tuple[float, float]:
+    """Return the silence continuation schedule ``(delay_s, next_silence_deadline)``.
+
+    The first continuation anchors to the latest accepted append's submission
+    time (``last_submit + chunk_period_s``), falling back to ``now`` when no
+    submission exists. Later continuations advance from the current deadline
+    instead of from ``now``, so pipeline processing time does not accumulate
+    as timer drift. When the schedule is more than one period overdue it is
+    stale: one continuation submits immediately and the schedule restarts
+    from ``now`` (``next_silence_deadline = now + chunk_period_s``) instead of
+    firing a burst of catch-ups.
+
+    ``delay_s`` is the wait before this continuation and
+    ``next_silence_deadline`` the deadline for the following one.
+    """
+    if current_deadline is None:
+        base = last_submit if last_submit is not None else now
+        deadline = base + chunk_period_s
+    else:
+        deadline = current_deadline
+    if now - deadline > chunk_period_s:
+        deadline = now
+    delay_s = max(0.0, deadline - now)
+    return delay_s, deadline + chunk_period_s
 
 
 class DuplexSessionRunner:
@@ -918,12 +951,23 @@ class DuplexSessionRunner:
         operation_id: str | None = None,
         retained_committed_payload: dict[str, object] | None = None,
         silence_continuation: bool = False,
+        next_silence_deadline: float | None = None,
+        on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
         if not silence_continuation:
             self._mark_pending_silence_superseded()
+            if on_append_accepted is None:
+                # A real (non-silence) input re-anchors the silence pacing
+                # chain: its submission becomes the anchor and the stored
+                # deadline is cleared until the next continuation sets one.
+                def _reanchor_chain(submit_time: float) -> None:
+                    model_state.last_native_submit_monotonic = submit_time
+                    model_state.silence_deadline_monotonic = None
+
+                on_append_accepted = _reanchor_chain
         append_epoch = session.epoch
         append_turn_id = payload_turn_id(payload)
         if append_turn_id is None:
@@ -949,6 +993,9 @@ class DuplexSessionRunner:
             operation_id=operation_id,
             retained_committed_payload=retained_committed_payload,
             precreated_response_id=session.active_response_id if precreate_response else None,
+            silence_continuation=silence_continuation,
+            next_silence_deadline=next_silence_deadline,
+            on_append_accepted=on_append_accepted,
             before_append=before_append,
         )
 
@@ -1032,21 +1079,31 @@ class DuplexSessionRunner:
         append_tail = self.tasks.append_tail
         if (append_tail is None or append_tail.done()) and self._real_input_waiting():
             return False
-        continuation_delay_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
-        if continuation_delay_s > 0:
-            await asyncio.sleep(continuation_delay_s)
-            if (
-                self.tasks.append_tail is not append_tail
-                or ((append_tail is None or append_tail.done()) and self._real_input_waiting())
-                or self.model.silence_continuation_is_stale(
-                    request_id=request_id,
-                    response_id=response_id,
-                    response_owned=response_owned,
-                    expected_epoch=expected_epoch,
-                    expected_model_turn_id=expected_model_turn_id,
-                )
-            ):
-                return False
+        chunk_period_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
+        # Align the next silence unit to submission_time_N + chunk_period and
+        # sleep only the remaining budget. The deadline is stored by the
+        # acceptance callback when the append actually submits, so skipped or
+        # stale continuations never advance the clock.
+        delay_s, next_silence_deadline = compute_silence_continuation_deadline(
+            chunk_period_s=chunk_period_s,
+            now=time.monotonic(),
+            last_submit=model_state.last_native_submit_monotonic,
+            current_deadline=model_state.silence_deadline_monotonic,
+        )
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+        if (
+            self.tasks.append_tail is not append_tail
+            or ((append_tail is None or append_tail.done()) and self._real_input_waiting())
+            or self.model.silence_continuation_is_stale(
+                request_id=request_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_model_turn_id=expected_model_turn_id,
+            )
+        ):
+            return False
 
         def _still_valid() -> bool:
             return not self._real_input_waiting() and not self.model.silence_continuation_is_stale(
@@ -1057,11 +1114,19 @@ class DuplexSessionRunner:
                 expected_model_turn_id=expected_model_turn_id,
             )
 
+        def _on_append_accepted(submit_time: float) -> None:
+            # Commit timing state once the runtime accepts the append; a real
+            # (non-silence) input re-anchors the chain.
+            model_state.last_native_submit_monotonic = submit_time
+            model_state.silence_deadline_monotonic = next_silence_deadline
+
         model_state.pending_silence_owner_id = owner_id
         task = await self._start_append(
             dict(payload) if isinstance(payload, dict) else {},
             final=False,
             silence_continuation=True,
+            next_silence_deadline=next_silence_deadline,
+            on_append_accepted=_on_append_accepted,
             before_append=_still_valid,
         )
         return task is not None

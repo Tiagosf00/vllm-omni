@@ -22,6 +22,7 @@ tracked task, and aborting a stage request in the background.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
@@ -146,12 +147,16 @@ class ModelChannel:
         operation_id: str | None = None,
         final: bool,
         expected_epoch: int | None = None,
+        on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
         if not session.capabilities.supports_input_append:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        # Anchor the submission time before the RPC; the acceptance callback
+        # commits timing state only if the append actually submitted.
+        submit_time = time.monotonic()
         try:
             result = await self._append_via_data_plane(
                 payload,
@@ -169,6 +174,10 @@ class ModelChannel:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        # Commit timing state before returned output events can clear the
+        # silence-continuation chain (e.g. a terminal turn-end).
+        if on_append_accepted is not None:
+            on_append_accepted(submit_time)
         request_id, _ = duplex_data_plane_request_info(result)
         if request_id is not None:
             self._ctx.plugin.data_plane.begin_request(request_id)
