@@ -951,7 +951,6 @@ class DuplexSessionRunner:
         operation_id: str | None = None,
         retained_committed_payload: dict[str, object] | None = None,
         silence_continuation: bool = False,
-        next_silence_deadline: float | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
     ) -> asyncio.Task[bool]:
@@ -993,8 +992,6 @@ class DuplexSessionRunner:
             operation_id=operation_id,
             retained_committed_payload=retained_committed_payload,
             precreated_response_id=session.active_response_id if precreate_response else None,
-            silence_continuation=silence_continuation,
-            next_silence_deadline=next_silence_deadline,
             on_append_accepted=on_append_accepted,
             before_append=before_append,
         )
@@ -1080,6 +1077,10 @@ class DuplexSessionRunner:
         if (append_tail is None or append_tail.done()) and self._real_input_waiting():
             return False
         chunk_period_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
+        # Snapshot the anchor after any wait for pending silence. A real append
+        # accepted between the snapshot and this continuation's submission
+        # re-anchors the chain; _still_valid() then skips the stale unit.
+        anchor = model_state.last_native_submit_monotonic
         # Align the next silence unit to submission_time_N + chunk_period and
         # sleep only the remaining budget. The deadline is stored by the
         # acceptance callback when the append actually submits, so skipped or
@@ -1087,7 +1088,7 @@ class DuplexSessionRunner:
         delay_s, next_silence_deadline = compute_silence_continuation_deadline(
             chunk_period_s=chunk_period_s,
             now=time.monotonic(),
-            last_submit=model_state.last_native_submit_monotonic,
+            last_submit=anchor,
             current_deadline=model_state.silence_deadline_monotonic,
         )
         if delay_s > 0:
@@ -1106,26 +1107,36 @@ class DuplexSessionRunner:
             return False
 
         def _still_valid() -> bool:
-            return not self._real_input_waiting() and not self.model.silence_continuation_is_stale(
-                request_id=request_id,
-                response_id=response_id,
-                response_owned=response_owned,
-                expected_epoch=expected_epoch,
-                expected_model_turn_id=expected_model_turn_id,
+            return (
+                # The anchor changed (a real append was accepted) after this
+                # continuation was planned; the unit is outdated.
+                model_state.last_native_submit_monotonic is anchor
+                and not self._real_input_waiting()
+                and not self.model.silence_continuation_is_stale(
+                    request_id=request_id,
+                    response_id=response_id,
+                    response_owned=response_owned,
+                    expected_epoch=expected_epoch,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
             )
 
         def _on_append_accepted(submit_time: float) -> None:
-            # Commit timing state once the runtime accepts the append; a real
-            # (non-silence) input re-anchors the chain.
+            # Commit timing state once the runtime accepts the append. If the
+            # submission is more than one chunk period past the planned
+            # deadline, the schedule is stale: restart from the actual
+            # submission. Small delays keep the planned cadence so ordinary
+            # jitter does not accumulate as drift.
             model_state.last_native_submit_monotonic = submit_time
-            model_state.silence_deadline_monotonic = next_silence_deadline
+            model_state.silence_deadline_monotonic = (
+                submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
+            )
 
         model_state.pending_silence_owner_id = owner_id
         task = await self._start_append(
             dict(payload) if isinstance(payload, dict) else {},
             final=False,
             silence_continuation=True,
-            next_silence_deadline=next_silence_deadline,
             on_append_accepted=_on_append_accepted,
             before_append=_still_valid,
         )

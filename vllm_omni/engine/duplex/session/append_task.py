@@ -53,10 +53,6 @@ class AppendAttempt:
     retained_committed_payload: dict[str, object] | None
     #: Response reserved before submission, to be failed if submission does not happen.
     precreated_response_id: str | None
-    #: This append is a silence continuation; it always carries the following
-    #: deadline so the acceptance callback can advance the pacing chain.
-    silence_continuation: bool = False
-    next_silence_deadline: float | None = None
     #: Commits timing state once the runtime accepts the append (before any
     #: returned output event can clear the continuation chain).
     on_append_accepted: Callable[[float], None] | None = None
