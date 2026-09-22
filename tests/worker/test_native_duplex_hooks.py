@@ -2763,6 +2763,161 @@ def test_minicpmo_stage0_native_sampler_uses_runner_duplex_rows():
     assert rows == [0]
 
 
+@pytest.fixture
+def minicpmo_duplex_lookahead_case(mocker):
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-lookahead", audio_chunk_idx=1, generated_tokens=[198])
+    runtime.sessions = {state.session_id: state}
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo45_tokenizer_cache = runtime.tokenizer
+    model._minicpmo45_native_duplex_token_ids_cache = MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(runtime.tokenizer)
+    model._minicpmo45_duplex_data_plane_helper = runtime
+    model._minicpmo45_duplex_row_sessions = {0: state.session_id}
+    # Noise classified as speech bypasses force-listen in the reported failure.
+    model._minicpmo45_duplex_row_payloads = {0: {"is_speech": True}}
+    model._minicpmo45_duplex_row_max_tokens = {0: 20}
+    metadata = mocker.Mock(
+        spec=SamplingMetadata,
+        all_greedy=True,
+        generators={0: torch.Generator(device="cpu").manual_seed(0)},
+        output_token_ids=[[]],
+        temperature=torch.tensor([0.7]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+    )
+    return model, runtime, state, metadata
+
+
+@pytest.mark.parametrize("all_greedy", [True, False], ids=["greedy", "random"])
+@pytest.mark.parametrize(
+    ("terminator_field", "turn_ended"),
+    [
+        ("listen_token_id", True),
+        ("chunk_eos_token_id", False),
+        ("chunk_tts_eos_token_id", False),
+        ("turn_eos_token_id", True),
+    ],
+    ids=["listen", "chunk_eos", "chunk_tts_eos", "turn_eos"],
+)
+def test_minicpmo_async_lookahead_preserves_boundary_until_append(
+    minicpmo_duplex_lookahead_case, terminator_field, turn_ended, all_greedy
+):
+    """Discarded lookahead must not alter policy, history, or subsequent sampling."""
+    model, runtime, state, metadata = minicpmo_duplex_lookahead_case
+    token_ids = model._minicpmo45_native_duplex_token_ids_cache
+    terminator = token_ids[terminator_field]
+    metadata.all_greedy = all_greedy
+    state.current_turn_ended = turn_ended
+    state.pending_speech_context = True
+    state.pending_speech_response_open = not turn_ended
+    logits = torch.full((1, 256), -100.0)
+    logits[0, terminator] = 20.0
+
+    first = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+
+    assert first.sampled_token_ids.tolist() == [[terminator]]
+    assert state.pending_terminator_token == terminator
+    history = list(state.generated_tokens)
+    speech_context = state.pending_speech_context
+    speech_open = state.pending_speech_response_open
+    rng_state = metadata.generators[0].get_state().clone()
+    metadata.output_token_ids = [[terminator]]
+
+    # Both ordinary text and a different boundary must leave the first stop
+    # intact. A listen while a speech turn is open would otherwise become TTS.
+    for candidate in (20, token_ids["listen_token_id"]):
+        logits.fill_(-100.0)
+        logits[0, candidate] = 20.0
+        stale = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+
+        assert stale.sampled_token_ids.tolist() == [[terminator]]
+        assert state.pending_terminator_token == terminator
+        assert state.last_terminator_token == terminator
+        assert state.current_turn_ended is turn_ended
+        assert state.pending_speech_context is speech_context
+        assert state.pending_speech_response_open is speech_open
+        assert state.generated_tokens == history
+        assert torch.equal(metadata.generators[0].get_state(), rng_state)
+
+    # Exercise actual consumption/reinsertion, rather than clearing the field
+    # in the test. The same session must resume ordinary generation afterward.
+    result = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=2)
+
+    assert result["success"] is True
+    assert result["input_token_ids"] == [terminator, 2, 1, 11]
+    assert state.pending_terminator_token is None
+    assert state.current_turn_ended is turn_ended
+    metadata.output_token_ids = [[]]
+    logits.fill_(-100.0)
+    logits[0, 20] = 20.0
+    resumed = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+
+    assert resumed.sampled_token_ids.tolist() == [[20]]
+    assert state.generated_tokens == [*history, 20]
+    assert state.pending_terminator_token is None
+    assert state.last_terminator_token is None
+    assert state.current_turn_ended is False
+
+
+def test_minicpmo_async_lookahead_preserves_force_listen_without_reapplying_mask(minicpmo_duplex_lookahead_case):
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+
+    model, _runtime, state, metadata = minicpmo_duplex_lookahead_case
+    listen_id = model._minicpmo45_native_duplex_token_ids_cache["listen_token_id"]
+    row = DuplexSamplingRow(
+        row_idx=0,
+        request_id="req-lookahead",
+        session_id=state.session_id,
+        seq=1,
+        payload={"is_speech": False},
+        max_tokens=20,
+    )
+    logits = torch.full((1, 256), -100.0)
+    logits[0, 20] = 20.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    first = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+    assert first.sampled_token_ids.tolist() == [[listen_id]]
+    history = list(state.generated_tokens)
+
+    # The same segment's force-listen mask is deduplicated on the stale step.
+    # Preserving its pending stop must suffice without clearing that dedup set.
+    logits.fill_(-100.0)
+    logits[0, 20] = 20.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert logits.argmax().item() == 20
+    stale = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+
+    assert stale.sampled_token_ids.tolist() == [[listen_id]]
+    assert state.pending_terminator_token == listen_id
+    assert state.current_turn_ended is True
+    assert state.generated_tokens == history
+
+
+def test_minicpmo_async_lookahead_does_not_return_missing_token_sentinel(minicpmo_duplex_lookahead_case):
+    model, _runtime, state, metadata = minicpmo_duplex_lookahead_case
+    state.pending_terminator_token = -1
+    model._minicpmo45_native_duplex_token_ids_cache.pop("chunk_tts_eos_token_id")
+    logits = torch.full((1, 256), -100.0)
+    logits[0, 20] = 20.0
+
+    sampled = model._sample_minicpmo45_native_duplex_stage0(logits, metadata, duplex_rows=[0])
+
+    assert sampled.sampled_token_ids.tolist() == [[20]]
+    assert state.generated_tokens == [198, 20]
+    assert state.pending_terminator_token is None
+    assert state.current_turn_ended is False
+
+
 def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
